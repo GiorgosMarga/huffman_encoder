@@ -40,9 +40,9 @@ pub fn Heap(comptime T: type) type {
             }
         }
 
-        pub fn get(self: *Self) !T {
+        pub fn get(self: *Self) ?T {
             if (self.items == 0) {
-                return error.EmptyHeap;
+                return null;
             }
             const item = self.buf[0];
             self.items -= 1;
