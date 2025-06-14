@@ -68,6 +68,27 @@ pub const Huffman = struct {
         return error.InvalidFileName;
     }
 
+    fn create_path(self: *Self, paths: []const []const u8) ![]u8 {
+        var total_length: usize = 0;
+        for (paths) |path| {
+            total_length += path.len;
+        }
+        // for /
+        total_length += paths.len;
+        const path = try self.arena.allocator().alloc(u8, total_length + 1);
+
+        std.mem.copyForwards(u8, path[0..1], ".");
+
+        var prev_length: usize = 1;
+        for (paths) |p| {
+            std.mem.copyForwards(u8, path[prev_length .. prev_length + 1], "/");
+            prev_length += 1;
+            std.mem.copyForwards(u8, path[prev_length .. p.len + prev_length], p);
+            prev_length += p.len;
+        }
+        return path;
+    }
+
     pub fn encode_directory(self: *Self, dir_path: []const u8) !void {
         var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
@@ -76,7 +97,7 @@ pub const Huffman = struct {
         defer self.arena.allocator().free(compressed_folder_name);
 
         std.mem.copyForwards(u8, compressed_folder_name[0..dir_path.len], dir_path);
-        std.mem.copyForwards(u8, compressed_folder_name[dir_path.len..], "_myzip");
+        std.mem.copyForwards(u8, compressed_folder_name[dir_path.len..], ".myzip");
 
         std.debug.print("New folder name: {s}\n", .{compressed_folder_name});
 
@@ -86,14 +107,12 @@ pub const Huffman = struct {
         defer iter.deinit();
 
         while (try iter.next()) |entry| {
-            var encoded_path = try self.arena.allocator().alloc(u8, entry.path.len + compressed_folder_name.len + 3);
-            std.mem.copyForwards(u8, encoded_path[0..2], "./");
-            std.mem.copyForwards(u8, encoded_path[2 .. compressed_folder_name.len + 2], compressed_folder_name);
-            std.mem.copyForwards(u8, encoded_path[compressed_folder_name.len + 2 .. compressed_folder_name.len + 3], "/");
-            std.mem.copyForwards(u8, encoded_path[compressed_folder_name.len + 3 ..], entry.path);
-            std.debug.print("Encoded path: {s}\n", .{encoded_path});
+            const encoded_path = try self.create_path(&[_][]const u8{ compressed_folder_name, entry.path });
+            defer self.arena.allocator().free(encoded_path);
+            const file_path = try self.create_path(&[_][]const u8{ dir_path, entry.path });
+            defer self.arena.allocator().free(file_path);
 
-            try self.encode(entry.path, encoded_path);
+            try self.encode(file_path, encoded_path);
         }
     }
 
@@ -125,18 +144,19 @@ pub const Huffman = struct {
         return bits_written;
     }
     pub fn encode(self: *Self, file_path: []const u8, new_file_name: ?[]const u8) !void {
-        const file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_only });
-
+        std.debug.print("Path: {s}\n", .{file_path});
+        const file = std.fs.cwd().openFile(file_path, .{ .mode = .read_only }) catch |err| {
+            std.debug.print("Error opening file: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer file.close();
         const compressed_file_name = if (new_file_name != null) new_file_name.? else try self.generateEncodedFilePath(file_path);
 
         const compressed_file = try std.fs.cwd().createFile(compressed_file_name, .{});
+        defer compressed_file.close();
 
         var bits_written: usize = 0;
         const writer = compressed_file.writer().any();
-        defer {
-            file.close();
-            compressed_file.close();
-        }
         var total_bytes_read: usize = 0;
         var bytes_read: usize = 0;
         var total_bytes_written: usize = 0;
@@ -416,9 +436,14 @@ pub const Huffman = struct {
     }
 };
 
-// test "filename" {
-//     const file_path = "test.txt";
-//     var iterator = std.mem.splitSequence(u8, file_path, ".");
-//     // const filename = iterator.buffer[0];
-//     std.debug.print("Filename: {s}\n", .{iterator.first()});
-// }
+test "create_path" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var huff = Huffman.init(&arena);
+
+    const paths: []const []const u8 = &[_][]const u8{ "test1", "test2" };
+
+    const full_path = try huff.create_path(paths);
+    std.debug.print("full path: {s}\n", .{full_path});
+}
