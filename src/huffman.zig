@@ -14,7 +14,7 @@ pub const Huffman = struct {
             if (self.freq == other.freq) {
                 return self.symbol < other.symbol;
             }
-            return self.freq < other.freq;
+            return self.freq <= other.freq;
         }
     };
 
@@ -68,7 +68,7 @@ pub const Huffman = struct {
         return error.InvalidFileName;
     }
 
-    fn create_path(self: *Self, paths: []const []const u8) ![]u8 {
+    fn createPath(self: *Self, paths: []const []const u8) ![]u8 {
         var total_length: usize = 0;
         for (paths) |path| {
             total_length += path.len;
@@ -89,15 +89,12 @@ pub const Huffman = struct {
         return path;
     }
 
-    pub fn encode_directory(self: *Self, dir_path: []const u8) !void {
+    pub fn encodeDirectory(self: *Self, dir_path: []const u8) !void {
         var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
 
-        var compressed_folder_name = try self.arena.allocator().alloc(u8, dir_path.len + 6);
+        const compressed_folder_name = try self.createPath(&[_][]u8{dir_path, ".myzip"});
         defer self.arena.allocator().free(compressed_folder_name);
-
-        std.mem.copyForwards(u8, compressed_folder_name[0..dir_path.len], dir_path);
-        std.mem.copyForwards(u8, compressed_folder_name[dir_path.len..], ".myzip");
 
         std.debug.print("New folder name: {s}\n", .{compressed_folder_name});
 
@@ -107,16 +104,16 @@ pub const Huffman = struct {
         defer iter.deinit();
 
         while (try iter.next()) |entry| {
-            const encoded_path = try self.create_path(&[_][]const u8{ compressed_folder_name, entry.path });
+            const encoded_path = try self.createPath(&[_][]const u8{ compressed_folder_name, entry.path });
             defer self.arena.allocator().free(encoded_path);
-            const file_path = try self.create_path(&[_][]const u8{ dir_path, entry.path });
+            const file_path = try self.createPath(&[_][]const u8{ dir_path, entry.path });
             defer self.arena.allocator().free(file_path);
 
             try self.encode(file_path, encoded_path);
         }
     }
 
-    fn encode_chunk(self: *Self, content: []const u8, writer: std.io.AnyWriter) !usize {
+    fn encodeChunk(self: *Self, content: []const u8, writer: std.io.AnyWriter) !usize {
         for (content) |c| {
             const res = try self.frequency_map.getOrPut(c);
             if (res.found_existing) {
@@ -143,8 +140,9 @@ pub const Huffman = struct {
         // std.debug.print("Wrote: {} bytes ({} bits)  from {} bytes; Shrink percentage: {}%\n", .{ bits_written / 8, bits_written, content.len, (content.len - (bits_written / 8)) * 100 / content.len });
         return bits_written;
     }
+
+    
     pub fn encode(self: *Self, file_path: []const u8, new_file_name: ?[]const u8) !void {
-        std.debug.print("Path: {s}\n", .{file_path});
         const file = std.fs.cwd().openFile(file_path, .{ .mode = .read_only }) catch |err| {
             std.debug.print("Error opening file: {s}\n", .{@errorName(err)});
             return;
@@ -152,7 +150,10 @@ pub const Huffman = struct {
         defer file.close();
         const compressed_file_name = if (new_file_name != null) new_file_name.? else try self.generateEncodedFilePath(file_path);
 
-        const compressed_file = try std.fs.cwd().createFile(compressed_file_name, .{});
+        const compressed_file = std.fs.cwd().createFile(compressed_file_name, .{}) catch |err| {
+            std.debug.print("Error creating file: ({s}) {s}\n", .{ compressed_file_name, @errorName(err) });
+            return;
+        };
         defer compressed_file.close();
 
         var bits_written: usize = 0;
@@ -175,11 +176,11 @@ pub const Huffman = struct {
                 std.debug.print("Error seeking: {s}\n", .{@errorName(err)});
             };
 
-            bits_written = try self.encode_chunk(content[0..bytes_read], writer);
-            // std.debug.print("", .{});
+            bits_written = try self.encodeChunk(content[0..bytes_read], writer);
             _ = compressed_file.seekTo(total_bytes_written) catch |err| {
                 std.debug.print("Error seeking to 0: {s}\n", .{@errorName(err)});
             };
+
             const t: u16 = @truncate(bits_written);
             writer.writeInt(u16, t, .big) catch |err| {
                 std.debug.print("Error writing bits: {s}\n", .{@errorName(err)});
@@ -193,15 +194,16 @@ pub const Huffman = struct {
             // read up to 1<<12 bytes, so there cant be more than 1<<12 symbols,
             // u16 is enough
             const num_of_symbols: u16 = @truncate(self.frequency_map.count());
+
             try writer.writeInt(u16, num_of_symbols, .little);
             bits_written += @sizeOf(u16) * 8;
             // write each symbol together with its frequency
             bits_written += try self.writeHuffmanTree(writer) * 8;
             while (bits_written % 8 != 0) bits_written += 1;
             total_bytes_written += bits_written / 8;
-
             self.resetMaps();
             self.resetHuffmanTree(self.tree);
+            self.tree = null;
         }
         std.debug.print("Wrote a total of {} bytes\n", .{total_bytes_written});
     }
@@ -226,8 +228,10 @@ pub const Huffman = struct {
     fn writeHuffmanTree(self: *Self, writer: std.io.AnyWriter) !usize {
         var bytes_written: usize = 0;
         const symbols = self.frequency_map.count();
+
         const symbols_buf = try self.arena.allocator().alloc(u8, symbols);
         const freq_buf = try self.arena.allocator().alloc(u16, symbols);
+
         var iter = self.frequency_map.iterator();
         var idx: usize = 0;
         while (iter.next()) |entry| {
@@ -235,6 +239,7 @@ pub const Huffman = struct {
             freq_buf[idx] = entry.value_ptr.*;
             idx += 1;
         }
+
 
         bytes_written = try writer.write(symbols_buf);
         for (freq_buf) |freq| {
@@ -245,21 +250,39 @@ pub const Huffman = struct {
         return bytes_written;
     }
 
-    pub fn decode_directory(self: *Self, dir_path: []const u8) !void {
+    pub fn decodeDirectory(self: *Self, dir_path: []const u8) !void {
         var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
+
+        var splitted_dir_name = std.mem.splitAny(u8, dir_path, ".");
+        const folder_name = splitted_dir_name.peek();
+        if (folder_name == null) {
+            return error.InvalidFolderName;
+        }
+
+        try std.fs.cwd().makeDir(folder_name.?);
 
         var iter = try dir.walk(self.arena.allocator());
         defer iter.deinit();
         while (try iter.next()) |entry| {
-            try self.decode(entry.path);
+            const decoded_file_path = try self.createPath(&[_][]const u8{ folder_name.?, entry.path });
+            const file_path = try self.createPath(&[_][]const u8{ dir_path, entry.path });
+            defer self.arena.allocator().free(decoded_file_path);
+            defer self.arena.allocator().free(file_path);
+            try self.decode(file_path, decoded_file_path);
         }
     }
-    pub fn decode(self: *Self, encoded_file_path: []const u8) !void {
-        const test_file = try std.fs.cwd().createFile("test.txt", .{});
-        defer test_file.close();
+    pub fn decode(self: *Self, encoded_file_path: []const u8, decoded_file_path: []const u8) !void {
+        const decoded_file = std.fs.cwd().createFile(decoded_file_path, .{}) catch |err| {
+            std.debug.print("Error creating decoded file ({s}): {s}\n", .{ decoded_file_path, @errorName(err) });
+            return;
+        };
+        defer decoded_file.close();
 
-        const encoded_file = try std.fs.cwd().openFile(encoded_file_path, .{ .mode = .read_only });
+        const encoded_file = std.fs.cwd().openFile(encoded_file_path, .{ .mode = .read_only }) catch |err| {
+            std.debug.print("Error opening encoded file ({s}): {s}\n", .{ encoded_file_path, @errorName(err) });
+            return;
+        };
         const reader = encoded_file.reader().any();
         defer encoded_file.close();
 
@@ -277,8 +300,6 @@ pub const Huffman = struct {
                 break;
             };
             if (bits_to_read == 0) break;
-            //Writing size at: 2309
-            // Writing tree size: 39 at pos: 4491
 
             bits_read = try bit_reader.readBitsBuf(bits_buf[0..bits_to_read]);
             std.debug.assert(bits_read == bits_to_read);
@@ -296,6 +317,9 @@ pub const Huffman = struct {
             bits_read += (@sizeOf(u8) + @sizeOf(u16)) * 8 * tree_size;
 
             self.tree = try self.generateHuffmanTree();
+
+            try self.generateCodes();
+
             var code: [1024]u1 = undefined;
             var code_idx: usize = 0;
             for (0..bits_to_read) |idx| {
@@ -303,12 +327,14 @@ pub const Huffman = struct {
                 code_idx += 1;
                 const val = self.getSymbol(code[0..code_idx]);
                 if (val) |v| {
-                    try test_file.writer().writeByte(v);
+                    try decoded_file.writer().writeByte(v);
                     code_idx = 0;
                 }
             }
+
             self.resetHuffmanTree(self.tree);
             self.resetMaps();
+            self.tree = null;
             std.debug.assert(bits_read % 8 == 0);
             // +2 because of the initial u16 read to get the bits of the encoded chunk
             total_bytes_read += bits_read / 8 + 2;
@@ -335,7 +361,7 @@ pub const Huffman = struct {
             }
         }
         if (curr) |c| {
-            if (c.symbol != '+') {
+            if (c.is_leaf) {
                 return c.symbol;
             }
         }
@@ -351,36 +377,44 @@ pub const Huffman = struct {
             try self.frequency_map.put(symbol, freq);
         }
     }
-
-    fn print_preorder(node: ?*Node) void {
-        if (node) |n| {
-            std.debug.print("{c} ", .{n.symbol});
-            print_preorder(n.left);
-            print_preorder(n.right);
-        }
-    }
-
     fn generateHuffmanTree(
         self: *Self,
     ) !*Node {
-        var heap = try Heap(*Node).init(self.arena.allocator(), 1024, Node.cmpNodes);
+        var heap = try Heap(*Node).init(self.arena.allocator(), self.frequency_map.count(), Node.cmpNodes);
+
         var it = self.frequency_map.iterator();
+        var node: *Node = undefined;
+
+        const buf = try self.arena.allocator().alloc(u8, self.frequency_map.count());
+        defer self.arena.allocator().free(buf);
+
+        var buf_idx: usize = 0;
+
         while (it.next()) |entry| {
-            const node = try self.arena.allocator().create(Node);
+            buf[buf_idx] = entry.key_ptr.*;
+            buf_idx += 1;
+        }
+
+        std.mem.sort(u8, buf, {}, comptime std.sort.asc(u8));
+
+        for (buf) |symbol| {
+            node = try self.arena.allocator().create(Node);
             node.* = .{
-                .freq = entry.value_ptr.*,
-                .symbol = entry.key_ptr.*,
+                .freq = self.frequency_map.get(symbol).?,
+                .symbol = symbol,
                 .left = null,
                 .right = null,
                 .is_leaf = true,
             };
             try heap.insert(node);
         }
+
+
         while (heap.items > 1) {
             const node1 = heap.get();
             const node2 = heap.get();
 
-            const node = try self.arena.allocator().create(Node);
+            node = try self.arena.allocator().create(Node);
 
             node.* = .{ .left = node1, .right = node2, .symbol = '+', .is_leaf = false, .freq = node1.?.freq + node2.?.freq };
             try heap.insert(node);
@@ -404,46 +438,31 @@ pub const Huffman = struct {
         std.debug.print("{s}\n", .{buf[0..idx]});
     }
     fn generateCodes(self: *Self) !void {
-        const code = try self.arena.allocator().alloc(u1, 0);
-        try self.iterateTree(self.tree, code);
+        var path: [256]u1 = undefined;
+        try self.iterateTree(self.tree, &path, 0);
     }
 
-    fn iterateTree(self: *Self, curr: ?*Node, path: []u1) !void {
+    fn iterateTree(self: *Self, curr: ?*Node, path: []u1, depth: usize) !void {
+        if (self.tree.?.is_leaf) {
+            // edge case only one symbol
+            const code = try self.arena.allocator().alloc(u1, 1);
+            code[0] = 0;
+            try self.codes.put(curr.?.symbol, code);
+            return;
+        }
         if (curr) |c| {
             if (c.is_leaf) {
-                if (path.len == 0) {
-                    // exception only one symbol exists
-                    var dummy = try self.arena.allocator().dupe(u1, path);
-                    dummy = try self.arena.allocator().realloc(dummy, 1);
-                    dummy[0] = 0;
-                    try self.codes.put(c.symbol, dummy);
-                    return;
-                }
-                try self.codes.put(c.symbol, path);
+                const code = try self.arena.allocator().dupe(u1, path[0..depth]);
+                try self.codes.put(c.symbol, code);
                 return;
             }
-            var left_path = try self.arena.allocator().dupe(u1, path);
-            left_path = try self.arena.allocator().realloc(left_path, left_path.len + 1);
-            left_path[left_path.len - 1] = 0;
 
-            var right_path = try self.arena.allocator().dupe(u1, path);
-            right_path = try self.arena.allocator().realloc(right_path, right_path.len + 1);
-            right_path[right_path.len - 1] = 1;
+            path[depth] = 0;
+            try self.iterateTree(c.left, path, depth + 1);
 
-            try self.iterateTree(c.left, left_path);
-            try self.iterateTree(c.right, right_path);
+            path[depth] = 1;
+            try self.iterateTree(c.right, path, depth + 1);
         }
     }
 };
 
-test "create_path" {
-    const allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var huff = Huffman.init(&arena);
-
-    const paths: []const []const u8 = &[_][]const u8{ "test1", "test2" };
-
-    const full_path = try huff.create_path(paths);
-    std.debug.print("full path: {s}\n", .{full_path});
-}
