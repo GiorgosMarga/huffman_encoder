@@ -49,7 +49,7 @@ test "huffman" {
     var encoder = Huffman.init(&arena);
     defer encoder.deinit();
 
-    const filename_to_encode = "./test_folder/kafka.txt";
+    const filename_to_encode = "./test_folder/file_93943.txt";
     const encoded_file_name = ".encoded";
     const decoded_file_name = ".decoded";
 

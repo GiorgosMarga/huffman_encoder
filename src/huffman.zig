@@ -4,6 +4,53 @@ const BitWriter = @import("bitwriter.zig").BitWriter;
 const BitReader = @import("bitreader.zig").BitReader;
 const Hash = std.hash.Wyhash;
 pub const Huffman = struct {
+    const Frequencies = struct {
+        freqs: []u16,
+        symbols: []u8,
+        idx: usize,
+        allocator: std.mem.Allocator,
+
+        fn init(allocator: std.mem.Allocator, num_of_symbols: usize) Frequencies {
+            return .{
+                .freqs = allocator.alloc(u16, num_of_symbols) catch |err| {
+                    std.debug.panic("{s}\n", .{@errorName(err)});
+                },
+                .symbols = allocator.alloc(u8, num_of_symbols) catch |err| {
+                    std.debug.panic("{s}\n", .{@errorName(err)});
+                },
+                .allocator = allocator,
+                .idx = 0,
+            };
+        }
+        fn reset(self: *Frequencies) void {
+            self.idx = 0;
+        }
+        fn insert(self: *Frequencies, symbol: u8) void {
+            for (0..self.idx) |i| {
+                if (self.symbols[i] == symbol) {
+                    self.freqs[i] += 1;
+                    return;
+                }
+            }
+            self.symbols[self.idx] = symbol;
+            self.freqs[self.idx] = 1;
+            self.idx += 1;
+        }
+        fn deinit(self: *Frequencies) void {
+            self.allocator.free(self.freqs);
+            self.allocator.free(self.symbols);
+        }
+        fn count(self: Frequencies) usize {
+            return self.idx;
+        }
+
+        fn insert_with_freq(self: *Frequencies, symbol: u8, freq: u16) void {
+            std.debug.assert(self.idx < self.symbols.len);
+            self.freqs[self.idx] = freq;
+            self.symbols[self.idx] = symbol;
+            self.idx += 1;
+        }
+    };
     const Node = struct {
         freq: usize,
         left: ?*Node,
@@ -19,12 +66,11 @@ pub const Huffman = struct {
     };
 
     const CodeMap = std.AutoHashMap(u8, []u1);
-    const FreqMap = std.AutoHashMap(u8, u16);
 
     tree: ?*Node,
     arena: *std.heap.ArenaAllocator,
-    codes: CodeMap,
-    frequency_map: FreqMap, // replace this
+    codes: CodeMap = undefined,
+    freqs: Frequencies = undefined,
 
     const Self = @This();
 
@@ -32,22 +78,19 @@ pub const Huffman = struct {
         var self: Self = .{
             .tree = null,
             .arena = arena,
-            .codes = undefined,
-            .frequency_map = undefined,
         };
-
+        self.freqs = Frequencies.init(self.arena.allocator(), 1 << 20);
         self.codes = CodeMap.init(self.arena.allocator());
-        self.frequency_map = FreqMap.init(self.arena.allocator());
         return self;
     }
 
     pub fn deinit(self: *Self) void {
-        self.frequency_map.deinit();
         var code_iter = self.codes.iterator();
         while (code_iter.next()) |code| {
             self.arena.allocator().free(code.value_ptr.*);
         }
         self.codes.deinit();
+        // self.freqs.deinit();
     }
     fn generateEncodedFilePath(self: Self, file_path: []const u8) ![]u8 {
         const my_zip_extension = ".my_zip";
@@ -93,7 +136,7 @@ pub const Huffman = struct {
         var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
 
-        const compressed_folder_name = try self.createPath(&[_][]u8{dir_path, ".myzip"});
+        const compressed_folder_name = try self.createPath(&[_][]u8{ dir_path, ".myzip" });
         defer self.arena.allocator().free(compressed_folder_name);
 
         std.debug.print("New folder name: {s}\n", .{compressed_folder_name});
@@ -115,12 +158,7 @@ pub const Huffman = struct {
 
     fn encodeChunk(self: *Self, content: []const u8, writer: std.io.AnyWriter) !usize {
         for (content) |c| {
-            const res = try self.frequency_map.getOrPut(c);
-            if (res.found_existing) {
-                res.value_ptr.* += 1;
-            } else {
-                res.value_ptr.* = 1;
-            }
+            self.freqs.insert(c);
         }
         self.tree = try self.generateHuffmanTree();
         try self.generateCodes();
@@ -141,7 +179,6 @@ pub const Huffman = struct {
         return bits_written;
     }
 
-    
     pub fn encode(self: *Self, file_path: []const u8, new_file_name: ?[]const u8) !void {
         const file = std.fs.cwd().openFile(file_path, .{ .mode = .read_only }) catch |err| {
             std.debug.print("Error opening file: {s}\n", .{@errorName(err)});
@@ -193,7 +230,7 @@ pub const Huffman = struct {
             // write how many symbols exist
             // read up to 1<<12 bytes, so there cant be more than 1<<12 symbols,
             // u16 is enough
-            const num_of_symbols: u16 = @truncate(self.frequency_map.count());
+            const num_of_symbols: u16 = @truncate(self.freqs.count());
 
             try writer.writeInt(u16, num_of_symbols, .little);
             bits_written += @sizeOf(u16) * 8;
@@ -222,24 +259,18 @@ pub const Huffman = struct {
         }
 
         self.codes.clearRetainingCapacity();
-        self.frequency_map.clearRetainingCapacity();
+        self.freqs.reset();
     }
 
     fn writeHuffmanTree(self: *Self, writer: std.io.AnyWriter) !usize {
         var bytes_written: usize = 0;
-        const symbols = self.frequency_map.count();
+        const symbols = self.freqs.count();
 
         const symbols_buf = try self.arena.allocator().alloc(u8, symbols);
         const freq_buf = try self.arena.allocator().alloc(u16, symbols);
 
-        var iter = self.frequency_map.iterator();
-        var idx: usize = 0;
-        while (iter.next()) |entry| {
-            symbols_buf[idx] = entry.key_ptr.*;
-            freq_buf[idx] = entry.value_ptr.*;
-            idx += 1;
-        }
-
+        std.mem.copyForwards(u8, symbols_buf, self.freqs.symbols[0..symbols]);
+        std.mem.copyForwards(u16, freq_buf, self.freqs.freqs[0..symbols]);
 
         bytes_written = try writer.write(symbols_buf);
         for (freq_buf) |freq| {
@@ -374,41 +405,28 @@ pub const Huffman = struct {
         std.debug.assert(read_symbols == num_of_symbols);
         for (symbols_buf) |symbol| {
             const freq = try reader.readInt(u16, .little);
-            try self.frequency_map.put(symbol, freq);
+            self.freqs.insert_with_freq(symbol, freq);
         }
     }
     fn generateHuffmanTree(
         self: *Self,
     ) !*Node {
-        var heap = try Heap(*Node).init(self.arena.allocator(), self.frequency_map.count(), Node.cmpNodes);
+        const num_of_symbols = self.freqs.count();
+        var heap = try Heap(*Node).init(self.arena.allocator(), num_of_symbols, Node.cmpNodes);
 
-        var it = self.frequency_map.iterator();
         var node: *Node = undefined;
 
-        const buf = try self.arena.allocator().alloc(u8, self.frequency_map.count());
-        defer self.arena.allocator().free(buf);
-
-        var buf_idx: usize = 0;
-
-        while (it.next()) |entry| {
-            buf[buf_idx] = entry.key_ptr.*;
-            buf_idx += 1;
-        }
-
-        std.mem.sort(u8, buf, {}, comptime std.sort.asc(u8));
-
-        for (buf) |symbol| {
+        for (0..num_of_symbols) |idx| {
             node = try self.arena.allocator().create(Node);
             node.* = .{
-                .freq = self.frequency_map.get(symbol).?,
-                .symbol = symbol,
+                .freq = self.freqs.freqs[idx],
+                .symbol = self.freqs.symbols[idx],
                 .left = null,
                 .right = null,
                 .is_leaf = true,
             };
             try heap.insert(node);
         }
-
 
         while (heap.items > 1) {
             const node1 = heap.get();
@@ -465,4 +483,3 @@ pub const Huffman = struct {
         }
     }
 };
-
